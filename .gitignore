@@ -1,0 +1,46 @@
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Go build and test artifacts
+bin/
+dist/
+coverage.out
+cover.out
+*.coverprofile
+*.test
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+go.work
+go.work.sum
+
+# Terraform provider binaries
+terraform-provider-convex
+terraform-provider-convex_v*
+terraform-registry-manifest.json
+
+# Terraform local state and overrides
+.terraform/
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfvars
+terraform.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+.terraformrc
+terraform.rc
+
+# Local environment files
+.direnv/
+.env
+.env.*
