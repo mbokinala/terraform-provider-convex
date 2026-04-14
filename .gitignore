@@ -21,7 +21,6 @@ go.work.sum
 # Terraform provider binaries
 terraform-provider-convex
 terraform-provider-convex_v*
-terraform-registry-manifest.json
 
 # Terraform local state and overrides
 .terraform/
