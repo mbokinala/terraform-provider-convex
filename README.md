@@ -30,6 +30,15 @@ resource "convex_environment_variable" "example" {
   name          = "EXAMPLE_VAR"
   value         = "example-value"
 }
+
+# Environment variables are non-sensitive by default. Set sensitive = true
+# and use sensitive_value when Terraform should redact the value.
+resource "convex_environment_variable" "secret" {
+  deployment_id    = data.convex_deployment.prod.id
+  name             = "SECRET_VAR"
+  sensitive        = true
+  sensitive_value  = var.secret_value
+}
 ```
 
 You can also supply the token with `CONVEX_TEAM_ACCESS_TOKEN`.

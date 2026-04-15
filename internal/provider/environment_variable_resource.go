@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -27,9 +28,11 @@ type environmentVariableResource struct {
 }
 
 type environmentVariableResourceModel struct {
-	DeploymentID types.Int64  `tfsdk:"deployment_id"`
-	Name         types.String `tfsdk:"name"`
-	Value        types.String `tfsdk:"value"`
+	DeploymentID   types.Int64  `tfsdk:"deployment_id"`
+	Name           types.String `tfsdk:"name"`
+	Value          types.String `tfsdk:"value"`
+	Sensitive      types.Bool   `tfsdk:"sensitive"`
+	SensitiveValue types.String `tfsdk:"sensitive_value"`
 }
 
 func NewEnvironmentVariableResource() resource.Resource {
@@ -58,9 +61,19 @@ func (r *environmentVariableResource) Schema(_ context.Context, _ resource.Schem
 				},
 			},
 			"value": schema.StringAttribute{
-				Required:    true,
+				Optional:    true,
+				Description: "Environment variable value when sensitive is false.",
+			},
+			"sensitive": schema.BoolAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(false),
+				Description: "Whether Terraform should treat this environment variable value as sensitive. Defaults to false.",
+			},
+			"sensitive_value": schema.StringAttribute{
+				Optional:    true,
 				Sensitive:   true,
-				Description: "Environment variable value.",
+				Description: "Environment variable value when sensitive is true.",
 			},
 		},
 	}
@@ -96,10 +109,11 @@ func (r *environmentVariableResource) Create(ctx context.Context, req resource.C
 		return
 	}
 
-	deploymentID, name, value, ok := validateEnvironmentVariableWriteModel(plan, &resp.Diagnostics, "create")
+	deploymentID, name, value, sensitive, ok := validateEnvironmentVariableWriteModel(plan, &resp.Diagnostics, "create")
 	if !ok {
 		return
 	}
+	setEnvironmentVariableStateValue(&plan, value, sensitive)
 
 	deployment, ok := resolveEnvironmentVariableDeployment(ctx, convexClient, deploymentID, name, &resp.Diagnostics, "create")
 	if !ok {
@@ -179,7 +193,7 @@ func (r *environmentVariableResource) Read(ctx context.Context, req resource.Rea
 
 		state.DeploymentID = types.Int64Value(deploymentID)
 		state.Name = types.StringValue(variable.Name)
-		state.Value = types.StringValue(variable.Value)
+		setEnvironmentVariableStateValue(&state, variable.Value, environmentVariableSensitiveOrDefault(state.Sensitive))
 
 		resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 		return
@@ -201,10 +215,11 @@ func (r *environmentVariableResource) Update(ctx context.Context, req resource.U
 		return
 	}
 
-	deploymentID, name, value, ok := validateEnvironmentVariableWriteModel(plan, &resp.Diagnostics, "update")
+	deploymentID, name, value, sensitive, ok := validateEnvironmentVariableWriteModel(plan, &resp.Diagnostics, "update")
 	if !ok {
 		return
 	}
+	setEnvironmentVariableStateValue(&plan, value, sensitive)
 
 	deployment, ok := resolveEnvironmentVariableDeployment(ctx, convexClient, deploymentID, name, &resp.Diagnostics, "update")
 	if !ok {
@@ -308,6 +323,7 @@ func (r *environmentVariableResource) ImportState(ctx context.Context, req resou
 
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("deployment_id"), deploymentID)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), name)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("sensitive"), false)...)
 }
 
 func (r *environmentVariableResource) getClient() (*client.ConvexClient, error) {
@@ -320,33 +336,23 @@ func (r *environmentVariableResource) getClient() (*client.ConvexClient, error) 
 
 func validateEnvironmentVariableWriteModel(model environmentVariableResourceModel, diagnostics interface {
 	AddError(summary string, detail string)
-}, action string) (int64, string, string, bool) {
+}, action string) (int64, string, string, bool, bool) {
 	deploymentID, ok := validateEnvironmentVariableDeploymentID(model.DeploymentID, diagnostics, action)
 	if !ok {
-		return 0, "", "", false
+		return 0, "", "", false, false
 	}
 
 	name, ok := validateEnvironmentVariableName(model.Name, diagnostics, action)
 	if !ok {
-		return 0, "", "", false
+		return 0, "", "", false, false
 	}
 
-	switch {
-	case model.Value.IsUnknown():
-		diagnostics.AddError(
-			"Unknown Environment Variable Value",
-			fmt.Sprintf("Cannot %s the Convex environment variable %q on deployment %d because the value is unknown.", action, name, deploymentID),
-		)
-		return 0, "", "", false
-	case model.Value.IsNull():
-		diagnostics.AddError(
-			"Missing Environment Variable Value",
-			fmt.Sprintf("Cannot %s the Convex environment variable %q on deployment %d because the value is null.", action, name, deploymentID),
-		)
-		return 0, "", "", false
+	value, sensitive, ok := validateEnvironmentVariableSelectedValue(model, diagnostics, action, deploymentID, name)
+	if !ok {
+		return 0, "", "", false, false
 	}
 
-	return deploymentID, name, model.Value.ValueString(), true
+	return deploymentID, name, value, sensitive, true
 }
 
 func validateEnvironmentVariableStateLookup(model environmentVariableResourceModel, diagnostics interface {
@@ -445,4 +451,88 @@ func validateEnvironmentVariableName(name types.String, diagnostics interface {
 	}
 
 	return value, true
+}
+
+func validateEnvironmentVariableSelectedValue(
+	model environmentVariableResourceModel,
+	diagnostics interface {
+		AddError(summary string, detail string)
+	},
+	action string,
+	deploymentID int64,
+	name string,
+) (string, bool, bool) {
+	sensitive := environmentVariableSensitiveOrDefault(model.Sensitive)
+
+	if sensitive {
+		if !model.Value.IsNull() {
+			diagnostics.AddError(
+				"Invalid Environment Variable Value Configuration",
+				fmt.Sprintf("Cannot %s the Convex environment variable %q on deployment %d because value cannot be set when sensitive is true. Use sensitive_value instead.", action, name, deploymentID),
+			)
+			return "", false, false
+		}
+
+		switch {
+		case model.SensitiveValue.IsUnknown():
+			diagnostics.AddError(
+				"Unknown Sensitive Environment Variable Value",
+				fmt.Sprintf("Cannot %s the Convex environment variable %q on deployment %d because sensitive_value is unknown.", action, name, deploymentID),
+			)
+			return "", false, false
+		case model.SensitiveValue.IsNull():
+			diagnostics.AddError(
+				"Missing Sensitive Environment Variable Value",
+				fmt.Sprintf("Cannot %s the Convex environment variable %q on deployment %d because sensitive is true but sensitive_value is null.", action, name, deploymentID),
+			)
+			return "", false, false
+		}
+
+		return model.SensitiveValue.ValueString(), true, true
+	}
+
+	if !model.SensitiveValue.IsNull() {
+		diagnostics.AddError(
+			"Invalid Environment Variable Value Configuration",
+			fmt.Sprintf("Cannot %s the Convex environment variable %q on deployment %d because sensitive_value cannot be set when sensitive is false. Use value instead.", action, name, deploymentID),
+		)
+		return "", false, false
+	}
+
+	switch {
+	case model.Value.IsUnknown():
+		diagnostics.AddError(
+			"Unknown Environment Variable Value",
+			fmt.Sprintf("Cannot %s the Convex environment variable %q on deployment %d because the value is unknown.", action, name, deploymentID),
+		)
+		return "", false, false
+	case model.Value.IsNull():
+		diagnostics.AddError(
+			"Missing Environment Variable Value",
+			fmt.Sprintf("Cannot %s the Convex environment variable %q on deployment %d because sensitive is false but value is null.", action, name, deploymentID),
+		)
+		return "", false, false
+	}
+
+	return model.Value.ValueString(), false, true
+}
+
+func environmentVariableSensitiveOrDefault(value types.Bool) bool {
+	if value.IsUnknown() || value.IsNull() {
+		return false
+	}
+
+	return value.ValueBool()
+}
+
+func setEnvironmentVariableStateValue(model *environmentVariableResourceModel, value string, sensitive bool) {
+	model.Sensitive = types.BoolValue(sensitive)
+	if sensitive {
+		model.Value = types.StringNull()
+		model.SensitiveValue = types.StringValue(value)
+		return
+	}
+
+	model.Value = types.StringValue(value)
+	model.SensitiveValue = types.StringNull()
 }
