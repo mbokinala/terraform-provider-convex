@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,12 +25,17 @@ const (
 
 	listEnvironmentVariablesPath   = "/list_environment_variables"
 	updateEnvironmentVariablesPath = "/update_environment_variables"
+
+	environmentVariableWriteMaxAttempts = 5
+	environmentVariableWriteBackoff     = 100 * time.Millisecond
+	environmentVariableWriteMaxBackoff  = time.Second
 )
 
 type ConvexClient struct {
 	token      string
 	teamID     int64
 	httpClient *http.Client
+	sleep      func(context.Context, time.Duration) error
 }
 
 type TokenDetails struct {
@@ -69,6 +75,24 @@ type updateEnvironmentVariablesRequest struct {
 	Changes []EnvVarChange `json:"changes"`
 }
 
+type apiError struct {
+	Method     string
+	URL        string
+	StatusCode int
+	Status     string
+	Code       string
+	Message    string
+	Detail     string
+}
+
+func (e *apiError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("%s %q returned status %s: %s", e.Method, e.URL, e.Status, e.Detail)
+	}
+
+	return fmt.Sprintf("%s %q returned status %s", e.Method, e.URL, e.Status)
+}
+
 func NewConvexClient(token string) (*ConvexClient, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -80,6 +104,7 @@ func NewConvexClient(token string) (*ConvexClient, error) {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		sleep: sleepWithContext,
 	}, nil
 }
 
@@ -250,14 +275,37 @@ func (c *ConvexClient) SetEnvironmentVariablesContext(ctx context.Context, deplo
 		return nil
 	}
 
-	req, err := c.newDeploymentRequest(ctx, http.MethodPost, deploymentName, updateEnvironmentVariablesPath, updateEnvironmentVariablesRequest{
-		Changes: changes,
-	})
-	if err != nil {
-		return err
+	backoff := environmentVariableWriteBackoff
+	var lastErr error
+
+	for attempt := 1; attempt <= environmentVariableWriteMaxAttempts; attempt++ {
+		req, err := c.newDeploymentRequest(ctx, http.MethodPost, deploymentName, updateEnvironmentVariablesPath, updateEnvironmentVariablesRequest{
+			Changes: changes,
+		})
+		if err != nil {
+			return err
+		}
+
+		lastErr = c.do(req, nil)
+		if lastErr == nil {
+			return nil
+		}
+
+		if !isRetryableEnvironmentVariableWriteError(lastErr) || attempt == environmentVariableWriteMaxAttempts {
+			return lastErr
+		}
+
+		if err := c.sleep(ctx, backoff); err != nil {
+			return errors.Join(lastErr, err)
+		}
+
+		backoff *= 2
+		if backoff > environmentVariableWriteMaxBackoff {
+			backoff = environmentVariableWriteMaxBackoff
+		}
 	}
 
-	return c.do(req, nil)
+	return lastErr
 }
 
 func (c *ConvexClient) DeleteEnvironmentVariable(deploymentName string, name string) error {
@@ -332,11 +380,24 @@ func (c *ConvexClient) do(req *http.Request, out any) error {
 		}
 
 		detail := strings.TrimSpace(string(body))
-		if detail != "" {
-			return fmt.Errorf("%s %q returned status %s: %s", req.Method, req.URL.String(), resp.Status, detail)
+		apiErr := &apiError{
+			Method:     req.Method,
+			URL:        req.URL.String(),
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Detail:     detail,
 		}
 
-		return fmt.Errorf("%s %q returned status %s", req.Method, req.URL.String(), resp.Status)
+		var payload struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if detail != "" && json.Unmarshal(body, &payload) == nil {
+			apiErr.Code = payload.Code
+			apiErr.Message = payload.Message
+		}
+
+		return apiErr
 	}
 
 	if out == nil {
@@ -349,6 +410,27 @@ func (c *ConvexClient) do(req *http.Request, out any) error {
 	}
 
 	return nil
+}
+
+func isRetryableEnvironmentVariableWriteError(err error) bool {
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+
+	return apiErr.StatusCode == http.StatusServiceUnavailable && apiErr.Code == "OptimisticConcurrencyControlFailure"
+}
+
+func sleepWithContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func decodeEnvironmentVariablesResponse(payload json.RawMessage) ([]EnvironmentVariable, error) {

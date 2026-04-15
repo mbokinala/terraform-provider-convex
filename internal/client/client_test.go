@@ -1,9 +1,14 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestDecodeEnvironmentVariablesResponse(t *testing.T) {
@@ -89,5 +94,96 @@ func TestSelectDeploymentByID(t *testing.T) {
 	want := deployments[0]
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("selectDeploymentByID() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSetEnvironmentVariablesContextRetriesOptimisticConcurrencyControlFailure(t *testing.T) {
+	t.Parallel()
+
+	attempts := 0
+	sleeps := make([]time.Duration, 0, 2)
+	client := &ConvexClient{
+		token: "test-token",
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				attempts++
+				if !strings.HasSuffix(req.URL.Path, updateEnvironmentVariablesPath) {
+					t.Fatalf("request path = %q, want suffix %q", req.URL.Path, updateEnvironmentVariablesPath)
+				}
+
+				if attempts < 3 {
+					return jsonResponse(http.StatusServiceUnavailable, `{"code":"OptimisticConcurrencyControlFailure","message":"try again"}`), nil
+				}
+
+				return jsonResponse(http.StatusOK, `{}`), nil
+			}),
+		},
+		sleep: func(_ context.Context, duration time.Duration) error {
+			sleeps = append(sleeps, duration)
+			return nil
+		},
+	}
+
+	value := "hello"
+	err := client.SetEnvironmentVariablesContext(context.Background(), "demo", []EnvVarChange{{
+		Name:  "EXAMPLE",
+		Value: &value,
+	}})
+	if err != nil {
+		t.Fatalf("SetEnvironmentVariablesContext() error = %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("SetEnvironmentVariablesContext() attempts = %d, want 3", attempts)
+	}
+
+	wantSleeps := []time.Duration{environmentVariableWriteBackoff, 2 * environmentVariableWriteBackoff}
+	if !reflect.DeepEqual(sleeps, wantSleeps) {
+		t.Fatalf("SetEnvironmentVariablesContext() sleeps = %#v, want %#v", sleeps, wantSleeps)
+	}
+}
+
+func TestSetEnvironmentVariablesContextDoesNotRetryNonRetryableErrors(t *testing.T) {
+	t.Parallel()
+
+	attempts := 0
+	client := &ConvexClient{
+		token: "test-token",
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				attempts++
+				return jsonResponse(http.StatusBadRequest, `{"code":"BadRequest","message":"nope"}`), nil
+			}),
+		},
+		sleep: func(_ context.Context, _ time.Duration) error {
+			t.Fatal("sleep should not be called for non-retryable errors")
+			return nil
+		},
+	}
+
+	value := "hello"
+	err := client.SetEnvironmentVariablesContext(context.Background(), "demo", []EnvVarChange{{
+		Name:  "EXAMPLE",
+		Value: &value,
+	}})
+	if err == nil {
+		t.Fatal("SetEnvironmentVariablesContext() error = nil, want non-nil")
+	}
+	if attempts != 1 {
+		t.Fatalf("SetEnvironmentVariablesContext() attempts = %d, want 1", attempts)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func jsonResponse(statusCode int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Status:     http.StatusText(statusCode),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
