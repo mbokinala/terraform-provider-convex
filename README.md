@@ -1,12 +1,16 @@
-# terraform-provider-convex
+# Convex Terraform Provider
 
 Terraform provider for Convex.
+
+Terraform Registry: [mbokinala/convex](https://registry.terraform.io/providers/mbokinala/convex/)
 
 Today it is intentionally small: it supports looking up an existing Convex deployment and managing its environment variables. More resources will come later.
 
 ## Usage
 
-Configure the provider with your Convex team access token:
+Install and reference the provider from the [Terraform Registry](https://registry.terraform.io/providers/mbokinala/convex/).
+
+Configure the provider with your Convex team access token, and manage environment variables from terraform:
 
 ```hcl
 terraform {
@@ -17,28 +21,33 @@ terraform {
   }
 }
 
+variable "convex_team_access_token" {
+  type      = string
+  sensitive = true
+}
+
 provider "convex" {
   team_access_token = var.convex_team_access_token
 }
 
 data "convex_deployment" "prod" {
-  name = "your-deployment-name"
+  name = "your-deployment-name" # e.g. nonchalant-tortoise-123
 }
 
-resource "convex_environment_variable" "example" {
+# Non-sensitive environment variable
+resource "convex_environment_variable" "api_base_url" {
   deployment_id = data.convex_deployment.prod.id
-  name          = "EXAMPLE_VAR"
-  value         = "example-value"
+  name          = "API_BASE_URL"
+  value         = var.api_base_url
 }
 
-# Environment variables are non-sensitive by default. Set sensitive = true
-# and use sensitive_value when Terraform should redact the value.
-resource "convex_environment_variable" "secret" {
-  deployment_id    = data.convex_deployment.prod.id
-  name             = "SECRET_VAR"
-  sensitive        = true
-  sensitive_value  = var.secret_value
+# Sensitive environment variable
+resource "convex_environment_variable" "stripe_secret_key" {
+  deployment_id   = data.convex_deployment.prod.id
+  name            = "STRIPE_SECRET_KEY"
+  sensitive       = true
+  sensitive_value = var.stripe_secret_key
 }
 ```
 
-You can also supply the token with `CONVEX_TEAM_ACCESS_TOKEN`.
+You can also supply the token by setting the `CONVEX_TEAM_ACCESS_TOKEN` environment variable.
